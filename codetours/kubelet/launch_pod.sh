@@ -80,6 +80,40 @@ EOF
     log_info "CNI network configuration created at $_CNI_CONF_FILE."
 }
 
+_create_kubelet_config() {
+    log_info "Creating Kubelet configuration file at $_KUBELET_CONFIG..."
+    sudo mkdir -p "$(dirname "$_KUBELET_CONFIG")"
+    sudo tee "$_KUBELET_CONFIG" > /dev/null <<EOF
+apiVersion: kubelet.config.k8s.io/v1beta1
+kind: KubeletConfiguration
+address: 0.0.0.0
+authentication:
+  anonymous:
+    enabled: true
+  webhook:
+    enabled: false
+authorization:
+  mode: AlwaysAllow
+failSwapOn: false
+containerRuntimeEndpoint: unix:///run/containerd/containerd.sock
+staticPodPath: /etc/kubernetes/manifests
+cgroupDriver: systemd
+clusterDomain: cluster.local
+clusterDNS:
+  - 10.96.0.10
+EOF
+    log_info "Kubelet configuration file created successfully."
+}
+
+_check_and_create_kubelet_config() {
+    log_info "Checking for Kubelet configuration file..."
+    if [ ! -f "$_KUBELET_CONFIG" ]; then
+        _create_kubelet_config
+    else
+        log_info "Kubelet configuration file already exists at $_KUBELET_CONFIG."
+    fi
+}
+
 _check_and_install_containerd() {
     log_info "Checking containerd..."
     if ! command -v containerd &> /dev/null; then
@@ -176,6 +210,7 @@ _main() {
     _check_and_install_cni_plugins
     _check_kubelet_process
     _generate_pod_manifest
+    _check_and_create_kubelet_config
     _start_kubelet
     _check_kubelet_status
 
