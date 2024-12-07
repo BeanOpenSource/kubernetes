@@ -18,7 +18,6 @@ package node
 
 import (
 	"context"
-	"encoding/json"
 	"fmt"
 	"strconv"
 	"time"
@@ -26,8 +25,6 @@ import (
 	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
-	"k8s.io/apimachinery/pkg/util/strategicpatch"
-	clientset "k8s.io/client-go/kubernetes"
 	"k8s.io/kubernetes/test/e2e/feature"
 	"k8s.io/kubernetes/test/e2e/framework"
 	e2enode "k8s.io/kubernetes/test/e2e/framework/node"
@@ -43,78 +40,6 @@ const (
 	fakeExtendedResource = "dummy.com/dummy"
 )
 
-func patchNode(ctx context.Context, client clientset.Interface, old *v1.Node, new *v1.Node) error {
-	oldData, err := json.Marshal(old)
-	if err != nil {
-		return err
-	}
-
-	newData, err := json.Marshal(new)
-	if err != nil {
-		return err
-	}
-	patchBytes, err := strategicpatch.CreateTwoWayMergePatch(oldData, newData, &v1.Node{})
-	if err != nil {
-		return fmt.Errorf("failed to create merge patch for node %q: %w", old.Name, err)
-	}
-	_, err = client.CoreV1().Nodes().Patch(ctx, old.Name, types.StrategicMergePatchType, patchBytes, metav1.PatchOptions{}, "status")
-	return err
-}
-
-func addExtendedResource(clientSet clientset.Interface, nodeName, extendedResourceName string, extendedResourceQuantity resource.Quantity) {
-	extendedResource := v1.ResourceName(extendedResourceName)
-
-	ginkgo.By("Adding a custom resource")
-	OriginalNode, err := clientSet.CoreV1().Nodes().Get(context.Background(), nodeName, metav1.GetOptions{})
-	framework.ExpectNoError(err)
-
-	node := OriginalNode.DeepCopy()
-	node.Status.Capacity[extendedResource] = extendedResourceQuantity
-	node.Status.Allocatable[extendedResource] = extendedResourceQuantity
-	err = patchNode(context.Background(), clientSet, OriginalNode.DeepCopy(), node)
-	framework.ExpectNoError(err)
-
-	gomega.Eventually(func() error {
-		node, err = clientSet.CoreV1().Nodes().Get(context.Background(), node.Name, metav1.GetOptions{})
-		framework.ExpectNoError(err)
-
-		fakeResourceCapacity, exists := node.Status.Capacity[extendedResource]
-		if !exists {
-			return fmt.Errorf("node %s has no %s resource capacity", node.Name, extendedResourceName)
-		}
-		if expectedResource := resource.MustParse("123"); fakeResourceCapacity.Cmp(expectedResource) != 0 {
-			return fmt.Errorf("node %s has resource capacity %s, expected: %s", node.Name, fakeResourceCapacity.String(), expectedResource.String())
-		}
-
-		return nil
-	}).WithTimeout(30 * time.Second).WithPolling(time.Second).ShouldNot(gomega.HaveOccurred())
-}
-
-func removeExtendedResource(clientSet clientset.Interface, nodeName, extendedResourceName string) {
-	extendedResource := v1.ResourceName(extendedResourceName)
-
-	ginkgo.By("Removing a custom resource")
-	originalNode, err := clientSet.CoreV1().Nodes().Get(context.Background(), nodeName, metav1.GetOptions{})
-	framework.ExpectNoError(err)
-
-	node := originalNode.DeepCopy()
-	delete(node.Status.Capacity, extendedResource)
-	delete(node.Status.Allocatable, extendedResource)
-	err = patchNode(context.Background(), clientSet, originalNode.DeepCopy(), node)
-	framework.ExpectNoError(err)
-
-	gomega.Eventually(func() error {
-		node, err = clientSet.CoreV1().Nodes().Get(context.Background(), nodeName, metav1.GetOptions{})
-		framework.ExpectNoError(err)
-
-		if _, exists := node.Status.Capacity[extendedResource]; exists {
-			return fmt.Errorf("node %s has resource capacity %s which is expected to be removed", node.Name, extendedResourceName)
-		}
-
-		return nil
-	}).WithTimeout(30 * time.Second).WithPolling(time.Second).ShouldNot(gomega.HaveOccurred())
-}
-
 func doPodResizeTests(f *framework.Framework) {
 	type testCase struct {
 		name                string
@@ -122,13 +47,16 @@ func doPodResizeTests(f *framework.Framework) {
 		patchString         string
 		expected            []e2epod.ResizableContainerInfo
 		addExtendedResource bool
+		// TODO(123940): test rollback for all test cases once resize is more responsive.
+		testRollback bool
 	}
 
 	noRestart := v1.NotRequired
 	doRestart := v1.RestartContainer
 	tests := []testCase{
 		{
-			name: "Guaranteed QoS pod, one container - increase CPU & memory",
+			name:         "Guaranteed QoS pod, one container - increase CPU & memory",
+			testRollback: true,
 			containers: []e2epod.ResizableContainerInfo{
 				{
 					Name:      "c1",
@@ -208,7 +136,8 @@ func doPodResizeTests(f *framework.Framework) {
 			},
 		},
 		{
-			name: "Guaranteed QoS pod, three containers (c1, c2, c3) - increase: CPU (c1,c3), memory (c2) ; decrease: CPU (c2), memory (c1,c3)",
+			name:         "Guaranteed QoS pod, three containers (c1, c2, c3) - increase: CPU (c1,c3), memory (c2) ; decrease: CPU (c2), memory (c1,c3)",
+			testRollback: true,
 			containers: []e2epod.ResizableContainerInfo{
 				{
 					Name:      "c1",
@@ -256,7 +185,8 @@ func doPodResizeTests(f *framework.Framework) {
 			},
 		},
 		{
-			name: "Burstable QoS pod, one container with cpu & memory requests + limits - decrease memory requests only",
+			name:         "Burstable QoS pod, one container with cpu & memory requests + limits - decrease memory requests only",
+			testRollback: true,
 			containers: []e2epod.ResizableContainerInfo{
 				{
 					Name:      "c1",
@@ -274,7 +204,8 @@ func doPodResizeTests(f *framework.Framework) {
 			},
 		},
 		{
-			name: "Burstable QoS pod, one container with cpu & memory requests + limits - decrease memory limits only",
+			name:         "Burstable QoS pod, one container with cpu & memory requests + limits - decrease memory limits only",
+			testRollback: true,
 			containers: []e2epod.ResizableContainerInfo{
 				{
 					Name:      "c1",
@@ -328,7 +259,8 @@ func doPodResizeTests(f *framework.Framework) {
 			},
 		},
 		{
-			name: "Burstable QoS pod, one container with cpu & memory requests + limits - decrease CPU requests only",
+			name:         "Burstable QoS pod, one container with cpu & memory requests + limits - decrease CPU requests only",
+			testRollback: true,
 			containers: []e2epod.ResizableContainerInfo{
 				{
 					Name:      "c1",
@@ -346,7 +278,8 @@ func doPodResizeTests(f *framework.Framework) {
 			},
 		},
 		{
-			name: "Burstable QoS pod, one container with cpu & memory requests + limits - decrease CPU limits only",
+			name:         "Burstable QoS pod, one container with cpu & memory requests + limits - decrease CPU limits only",
+			testRollback: true,
 			containers: []e2epod.ResizableContainerInfo{
 				{
 					Name:      "c1",
@@ -634,7 +567,44 @@ func doPodResizeTests(f *framework.Framework) {
 			},
 		},
 		{
-			name: "Guaranteed QoS pod, one container - increase CPU (NotRequired) & memory (RestartContainer)",
+			name: "Burstable QoS pod, one container with cpu & memory requests - increase cpu request",
+			containers: []e2epod.ResizableContainerInfo{
+				{
+					Name:      "c1",
+					Resources: &e2epod.ContainerResources{CPUReq: "200m", MemReq: "500Mi"},
+				},
+			},
+			patchString: `{"spec":{"containers":[
+						{"name":"c1", "resources":{"requests":{"cpu":"300m"}}}
+					]}}`,
+			expected: []e2epod.ResizableContainerInfo{
+				{
+					Name:      "c1",
+					Resources: &e2epod.ContainerResources{CPUReq: "300m", MemReq: "500Mi"},
+				},
+			},
+		},
+		{
+			name: "Burstable QoS pod, one container with cpu requests and limits - resize with equivalents",
+			containers: []e2epod.ResizableContainerInfo{
+				{
+					Name:      "c1",
+					Resources: &e2epod.ContainerResources{CPUReq: "2m", CPULim: "10m"},
+				},
+			},
+			patchString: `{"spec":{"containers":[
+						{"name":"c1", "resources":{"requests":{"cpu":"1m"},"limits":{"cpu":"5m"}}}
+					]}}`,
+			expected: []e2epod.ResizableContainerInfo{
+				{
+					Name:      "c1",
+					Resources: &e2epod.ContainerResources{CPUReq: "1m", CPULim: "5m"},
+				},
+			},
+		},
+		{
+			name:         "Guaranteed QoS pod, one container - increase CPU (NotRequired) & memory (RestartContainer)",
+			testRollback: true,
 			containers: []e2epod.ResizableContainerInfo{
 				{
 					Name:      "c1",
@@ -657,7 +627,8 @@ func doPodResizeTests(f *framework.Framework) {
 			},
 		},
 		{
-			name: "Burstable QoS pod, one container - decrease CPU (RestartContainer) & memory (NotRequired)",
+			name:         "Burstable QoS pod, one container - decrease CPU (RestartContainer) & memory (NotRequired)",
+			testRollback: true,
 			containers: []e2epod.ResizableContainerInfo{
 				{
 					Name:      "c1",
@@ -824,6 +795,102 @@ func doPodResizeTests(f *framework.Framework) {
 			},
 		},
 		{
+			name: "Burstable QoS pod, mixed containers - scale up cpu and memory",
+			containers: []e2epod.ResizableContainerInfo{
+				{
+					Name:      "c1",
+					Resources: &e2epod.ContainerResources{CPUReq: "100m", CPULim: "100m", MemReq: "100Mi", MemLim: "100Mi"},
+					CPUPolicy: &noRestart,
+					MemPolicy: &noRestart,
+				},
+				{
+					Name:      "c2",
+					Resources: &e2epod.ContainerResources{},
+				},
+			},
+			patchString: `{"spec":{"containers":[
+						{"name":"c1", "resources":{"requests":{"cpu":"200m","memory":"200Mi"},"limits":{"cpu":"200m","memory":"200Mi"}}}
+					]}}`,
+			expected: []e2epod.ResizableContainerInfo{
+				{
+					Name:      "c1",
+					Resources: &e2epod.ContainerResources{CPUReq: "200m", CPULim: "200m", MemReq: "200Mi", MemLim: "200Mi"},
+					CPUPolicy: &noRestart,
+					MemPolicy: &noRestart,
+				},
+				{
+					Name:      "c2",
+					Resources: &e2epod.ContainerResources{},
+				},
+			},
+		},
+		{
+			name: "Burstable QoS pod, mixed containers - add requests",
+			containers: []e2epod.ResizableContainerInfo{
+				{
+					Name:      "c1",
+					Resources: &e2epod.ContainerResources{CPUReq: "100m", CPULim: "100m", MemReq: "100Mi", MemLim: "100Mi"},
+					CPUPolicy: &noRestart,
+					MemPolicy: &noRestart,
+				},
+				{
+					Name:      "c2",
+					Resources: &e2epod.ContainerResources{},
+				},
+			},
+			patchString: `{"spec":{"containers":[
+						{"name":"c2", "resources":{"requests":{"cpu":"100m","memory":"100Mi"}}}
+					]}}`,
+			expected: []e2epod.ResizableContainerInfo{
+				{
+					Name:      "c1",
+					Resources: &e2epod.ContainerResources{CPUReq: "100m", CPULim: "100m", MemReq: "100Mi", MemLim: "100Mi"},
+					CPUPolicy: &noRestart,
+					MemPolicy: &noRestart,
+				},
+				{
+					Name:      "c2",
+					Resources: &e2epod.ContainerResources{CPUReq: "100m", MemReq: "100Mi"},
+					CPUPolicy: &noRestart,
+					MemPolicy: &noRestart,
+				},
+			},
+		},
+		{
+			name: "Burstable QoS pod, mixed containers - add limits",
+			containers: []e2epod.ResizableContainerInfo{
+				{
+					Name:      "c1",
+					Resources: &e2epod.ContainerResources{CPUReq: "100m", CPULim: "100m", MemReq: "100Mi", MemLim: "100Mi"},
+					CPUPolicy: &noRestart,
+					MemPolicy: &noRestart,
+				},
+				{
+					Name:      "c2",
+					Resources: &e2epod.ContainerResources{CPUReq: "100m", MemReq: "100Mi"},
+					CPUPolicy: &noRestart,
+					MemPolicy: &noRestart,
+				},
+			},
+			patchString: `{"spec":{"containers":[
+						{"name":"c2", "resources":{"limits":{"cpu":"200m","memory":"200Mi"}}}
+					]}}`,
+			expected: []e2epod.ResizableContainerInfo{
+				{
+					Name:      "c1",
+					Resources: &e2epod.ContainerResources{CPUReq: "100m", CPULim: "100m", MemReq: "100Mi", MemLim: "100Mi"},
+					CPUPolicy: &noRestart,
+					MemPolicy: &noRestart,
+				},
+				{
+					Name:      "c2",
+					Resources: &e2epod.ContainerResources{CPUReq: "100m", CPULim: "200m", MemReq: "100Mi", MemLim: "200Mi"},
+					CPUPolicy: &noRestart,
+					MemPolicy: &noRestart,
+				},
+			},
+		},
+		{
 			name: "Guaranteed QoS pod, one container - increase CPU & memory with an extended resource",
 			containers: []e2epod.ResizableContainerInfo{
 				{
@@ -848,9 +915,23 @@ func doPodResizeTests(f *framework.Framework) {
 			},
 			addExtendedResource: true,
 		},
+		{
+			name: "BestEffort QoS pod - empty resize",
+			containers: []e2epod.ResizableContainerInfo{
+				{
+					Name:      "c1",
+					Resources: &e2epod.ContainerResources{},
+				},
+			},
+			patchString: `{}`,
+			expected: []e2epod.ResizableContainerInfo{
+				{
+					Name:      "c1",
+					Resources: &e2epod.ContainerResources{},
+				},
+			},
+		},
 	}
-
-	timeouts := framework.NewTimeoutContext()
 
 	for idx := range tests {
 		tc := tests[idx]
@@ -862,7 +943,8 @@ func doPodResizeTests(f *framework.Framework) {
 			tStamp := strconv.Itoa(time.Now().Nanosecond())
 			e2epod.InitDefaultResizePolicy(tc.containers)
 			e2epod.InitDefaultResizePolicy(tc.expected)
-			testPod = e2epod.MakePodWithResizableContainers(f.Namespace.Name, "testpod", tStamp, tc.containers)
+			testPod = e2epod.MakePodWithResizableContainers(f.Namespace.Name, "", tStamp, tc.containers)
+			testPod.GenerateName = "resize-test-"
 			testPod = e2epod.MustMixinRestrictedPodSecurity(testPod)
 
 			if tc.addExtendedResource {
@@ -870,11 +952,11 @@ func doPodResizeTests(f *framework.Framework) {
 				framework.ExpectNoError(err)
 
 				for _, node := range nodes.Items {
-					addExtendedResource(f.ClientSet, node.Name, fakeExtendedResource, resource.MustParse("123"))
+					e2enode.AddExtendedResource(ctx, f.ClientSet, node.Name, fakeExtendedResource, resource.MustParse("123"))
 				}
 				defer func() {
 					for _, node := range nodes.Items {
-						removeExtendedResource(f.ClientSet, node.Name, fakeExtendedResource)
+						e2enode.RemoveExtendedResource(ctx, f.ClientSet, node.Name, fakeExtendedResource)
 					}
 				}()
 			}
@@ -882,53 +964,50 @@ func doPodResizeTests(f *framework.Framework) {
 			ginkgo.By("creating pod")
 			newPod := podClient.CreateSync(ctx, testPod)
 
-			ginkgo.By("verifying initial pod resources, allocations are as expected")
+			ginkgo.By("verifying initial pod resources are as expected")
 			e2epod.VerifyPodResources(newPod, tc.containers)
 			ginkgo.By("verifying initial pod resize policy is as expected")
 			e2epod.VerifyPodResizePolicy(newPod, tc.containers)
 
 			ginkgo.By("verifying initial pod status resources are as expected")
-			e2epod.VerifyPodStatusResources(newPod, tc.containers)
+			framework.ExpectNoError(e2epod.VerifyPodStatusResources(newPod, tc.containers))
 			ginkgo.By("verifying initial cgroup config are as expected")
 			framework.ExpectNoError(e2epod.VerifyPodContainersCgroupValues(ctx, f, newPod, tc.containers))
 
-			patchAndVerify := func(patchString string, expectedContainers []e2epod.ResizableContainerInfo, initialContainers []e2epod.ResizableContainerInfo, opStr string, isRollback bool) {
+			patchAndVerify := func(patchString string, expectedContainers []e2epod.ResizableContainerInfo, opStr string) {
 				ginkgo.By(fmt.Sprintf("patching pod for %s", opStr))
-				patchedPod, pErr = f.ClientSet.CoreV1().Pods(newPod.Namespace).Patch(context.TODO(), newPod.Name,
-					types.StrategicMergePatchType, []byte(patchString), metav1.PatchOptions{})
+				patchedPod, pErr = f.ClientSet.CoreV1().Pods(newPod.Namespace).Patch(ctx, newPod.Name,
+					types.StrategicMergePatchType, []byte(patchString), metav1.PatchOptions{}, "resize")
 				framework.ExpectNoError(pErr, fmt.Sprintf("failed to patch pod for %s", opStr))
 
 				ginkgo.By(fmt.Sprintf("verifying pod patched for %s", opStr))
 				e2epod.VerifyPodResources(patchedPod, expectedContainers)
-				gomega.Eventually(ctx, e2epod.VerifyPodAllocations, timeouts.PodStartShort, timeouts.Poll).
-					WithArguments(patchedPod, initialContainers).
-					Should(gomega.BeNil(), "failed to verify Pod allocations for patchedPod")
 
 				ginkgo.By(fmt.Sprintf("waiting for %s to be actuated", opStr))
-				resizedPod := e2epod.WaitForPodResizeActuation(ctx, f, podClient, newPod, patchedPod, expectedContainers, initialContainers, isRollback)
-
-				// Check cgroup values only for containerd versions before 1.6.9
-				ginkgo.By(fmt.Sprintf("verifying pod container's cgroup values after %s", opStr))
-				framework.ExpectNoError(e2epod.VerifyPodContainersCgroupValues(ctx, f, resizedPod, expectedContainers))
-
-				ginkgo.By(fmt.Sprintf("verifying pod resources after %s", opStr))
-				e2epod.VerifyPodResources(resizedPod, expectedContainers)
-
-				ginkgo.By(fmt.Sprintf("verifying pod allocations after %s", opStr))
-				gomega.Eventually(ctx, e2epod.VerifyPodAllocations, timeouts.PodStartShort, timeouts.Poll).
-					WithArguments(resizedPod, expectedContainers).
-					Should(gomega.BeNil(), "failed to verify Pod allocations for resizedPod")
+				resizedPod := e2epod.WaitForPodResizeActuation(ctx, f, podClient, newPod)
+				e2epod.ExpectPodResized(ctx, f, resizedPod, expectedContainers)
 			}
 
-			patchAndVerify(tc.patchString, tc.expected, tc.containers, "resize", false)
+			patchAndVerify(tc.patchString, tc.expected, "resize")
 
-			rbPatchStr, err := e2epod.ResizeContainerPatch(tc.containers)
-			framework.ExpectNoError(err)
-			// Resize has been actuated, test rollback
-			patchAndVerify(rbPatchStr, tc.containers, tc.expected, "rollback", true)
+			if tc.testRollback {
+				// Resize has been actuated, test rollback
+				rollbackContainers := make([]e2epod.ResizableContainerInfo, len(tc.containers))
+				copy(rollbackContainers, tc.containers)
+				for i, c := range rollbackContainers {
+					gomega.Expect(c.Name).To(gomega.Equal(tc.expected[i].Name),
+						"test case containers & expectations should be in the same order")
+					// Resizes that trigger a restart should trigger a second restart when rolling back.
+					rollbackContainers[i].RestartCount = tc.expected[i].RestartCount * 2
+				}
+
+				rbPatchStr, err := e2epod.ResizeContainerPatch(tc.containers)
+				framework.ExpectNoError(err)
+				patchAndVerify(rbPatchStr, rollbackContainers, "rollback")
+			}
 
 			ginkgo.By("deleting pod")
-			podClient.DeleteSync(ctx, newPod.Name, metav1.DeleteOptions{}, timeouts.PodDelete)
+			framework.ExpectNoError(podClient.Delete(ctx, newPod.Name, metav1.DeleteOptions{}))
 		})
 	}
 }
@@ -954,16 +1033,92 @@ func doPodResizeErrorTests(f *framework.Framework) {
 			patchString: `{"spec":{"containers":[
 						{"name":"c1", "resources":{"requests":{"memory":"400Mi"}}}
 					]}}`,
-			patchError: "Pod QoS is immutable",
+			patchError: "Pod QOS Class may not change as a result of resizing",
 			expected: []e2epod.ResizableContainerInfo{
 				{
 					Name: "c1",
 				},
 			},
 		},
+		{
+			name: "Burstable QoS pod, one container with cpu & memory requests + limits - remove memory limits",
+			containers: []e2epod.ResizableContainerInfo{
+				{
+					Name:      "c1",
+					Resources: &e2epod.ContainerResources{CPUReq: "200m", CPULim: "400m", MemReq: "250Mi", MemLim: "500Mi"},
+				},
+			},
+			patchString: `{"spec":{"containers":[
+						{"name":"c1", "resources":{"limits":{"memory": null}}}
+					]}}`,
+			patchError: "resource limits cannot be removed",
+			expected: []e2epod.ResizableContainerInfo{
+				{
+					Name:      "c1",
+					Resources: &e2epod.ContainerResources{CPUReq: "200m", CPULim: "400m", MemReq: "250Mi", MemLim: "500Mi"},
+				},
+			},
+		},
+		{
+			name: "Burstable QoS pod, one container with cpu & memory requests + limits - remove CPU limits",
+			containers: []e2epod.ResizableContainerInfo{
+				{
+					Name:      "c1",
+					Resources: &e2epod.ContainerResources{CPUReq: "200m", CPULim: "400m", MemReq: "250Mi", MemLim: "500Mi"},
+				},
+			},
+			patchString: `{"spec":{"containers":[
+						{"name":"c1", "resources":{"limits":{"cpu": null}}}
+					]}}`,
+			patchError: "resource limits cannot be removed",
+			expected: []e2epod.ResizableContainerInfo{
+				{
+					Name:      "c1",
+					Resources: &e2epod.ContainerResources{CPUReq: "200m", CPULim: "400m", MemReq: "250Mi", MemLim: "500Mi"},
+				},
+			},
+		},
+		{
+			name: "Burstable QoS pod, one container with memory requests + limits, cpu requests - remove CPU requests",
+			containers: []e2epod.ResizableContainerInfo{
+				{
+					Name:      "c1",
+					Resources: &e2epod.ContainerResources{CPUReq: "200m", MemReq: "250Mi", MemLim: "500Mi"},
+				},
+			},
+			patchString: `{"spec":{"containers":[
+						{"name":"c1", "resources":{"requests":{"cpu": null}}}
+					]}}`,
+			patchError: "resource requests cannot be removed",
+			expected: []e2epod.ResizableContainerInfo{
+				{
+					Name:      "c1",
+					Resources: &e2epod.ContainerResources{CPUReq: "200m", MemReq: "250Mi", MemLim: "500Mi"},
+				},
+			},
+		},
+		{
+			name: "Burstable QoS pod, one container with CPU requests + limits, cpu requests - remove memory requests",
+			containers: []e2epod.ResizableContainerInfo{
+				{
+					Name:      "c1",
+					Resources: &e2epod.ContainerResources{CPUReq: "200m", CPULim: "400m", MemReq: "250Mi"},
+				},
+			},
+			patchString: `{"spec":{"containers":[
+						{"name":"c1", "resources":{"requests":{"memory": null}}}
+					]}}`,
+			patchError: "resource requests cannot be removed",
+			expected: []e2epod.ResizableContainerInfo{
+				{
+					Name:      "c1",
+					Resources: &e2epod.ContainerResources{CPUReq: "200m", CPULim: "400m", MemReq: "250Mi"},
+				},
+			},
+		},
 	}
 
-	timeouts := framework.NewTimeoutContext()
+	timeouts := f.Timeouts
 
 	for idx := range tests {
 		tc := tests[idx]
@@ -981,30 +1136,29 @@ func doPodResizeErrorTests(f *framework.Framework) {
 			ginkgo.By("creating pod")
 			newPod := podClient.CreateSync(ctx, testPod)
 
-			ginkgo.By("verifying initial pod resources, allocations, and policy are as expected")
+			ginkgo.By("verifying initial pod resources, and policy are as expected")
 			e2epod.VerifyPodResources(newPod, tc.containers)
 			e2epod.VerifyPodResizePolicy(newPod, tc.containers)
 
 			ginkgo.By("verifying initial pod status resources and cgroup config are as expected")
-			e2epod.VerifyPodStatusResources(newPod, tc.containers)
+			framework.ExpectNoError(e2epod.VerifyPodStatusResources(newPod, tc.containers))
 
 			ginkgo.By("patching pod for resize")
 			patchedPod, pErr = f.ClientSet.CoreV1().Pods(newPod.Namespace).Patch(ctx, newPod.Name,
-				types.StrategicMergePatchType, []byte(tc.patchString), metav1.PatchOptions{})
+				types.StrategicMergePatchType, []byte(tc.patchString), metav1.PatchOptions{}, "resize")
 			if tc.patchError == "" {
 				framework.ExpectNoError(pErr, "failed to patch pod for resize")
 			} else {
-				gomega.Expect(pErr).To(gomega.HaveOccurred(), tc.patchError)
+				gomega.Expect(pErr).To(gomega.HaveOccurred())
+				gomega.Expect(pErr.Error()).To(gomega.ContainSubstring(tc.patchError))
 				patchedPod = newPod
 			}
 
 			ginkgo.By("verifying pod resources after patch")
 			e2epod.VerifyPodResources(patchedPod, tc.expected)
 
-			ginkgo.By("verifying pod allocations after patch")
-			gomega.Eventually(ctx, e2epod.VerifyPodAllocations, timeouts.PodStartShort, timeouts.Poll).
-				WithArguments(patchedPod, tc.expected).
-				Should(gomega.BeNil(), "failed to verify Pod allocations for patchedPod")
+			ginkgo.By("verifying pod status resources after patch")
+			framework.ExpectNoError(e2epod.VerifyPodStatusResources(patchedPod, tc.expected))
 
 			ginkgo.By("deleting pod")
 			podClient.DeleteSync(ctx, newPod.Name, metav1.DeleteOptions{}, timeouts.PodDelete)
