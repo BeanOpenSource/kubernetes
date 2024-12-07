@@ -214,10 +214,21 @@ type BasicDevice struct {
 	// The maximum number of attributes and capacities combined is 32.
 	//
 	// +optional
-	Capacity map[QualifiedName]resource.Quantity
+	Capacity map[QualifiedName]DeviceCapacity
 }
 
-// Limit for the sum of the number of entries in both ResourceSlices.
+// DeviceCapacity describes a quantity associated with a device.
+type DeviceCapacity struct {
+	// Value defines how much of a certain device capacity is available.
+	//
+	// +required
+	Value resource.Quantity
+
+	// potential future addition: fields which define how to "consume"
+	// capacity (= share a single device between different consumers).
+}
+
+// Limit for the sum of the number of entries in both attributes and capacity.
 const ResourceSliceMaxAttributesAndCapacitiesPerDevice = 32
 
 // QualifiedName is the name of a device attribute or capacity.
@@ -240,6 +251,9 @@ type QualifiedName string
 
 // FullyQualifiedName is a QualifiedName where the domain is set.
 type FullyQualifiedName string
+
+// DeviceMaxDomainLength is the maximum length of the domain prefix in a fully-qualified name.
+const DeviceMaxDomainLength = 63
 
 // DeviceMaxIDLength is the maximum length of the identifier in a device attribute or capacity name (`<domain>/<ID>`).
 const DeviceMaxIDLength = 32
@@ -640,9 +654,15 @@ type OpaqueDeviceConfiguration struct {
 	// includes self-identification and a version ("kind" + "apiVersion" for
 	// Kubernetes types), with conversion between different versions.
 	//
+	// The length of the raw data must be smaller or equal to 10 Ki.
+	//
 	// +required
 	Parameters runtime.RawExtension
 }
+
+// OpaqueParametersMaxLength is the maximum length of the raw data in an
+// [OpaqueDeviceConfiguration.Parameters] field.
+const OpaqueParametersMaxLength = 10 * 1024
 
 // ResourceClaimStatus tracks whether the resource has been allocated and what
 // the result of that was.
@@ -683,6 +703,18 @@ type ResourceClaimStatus struct {
 	// it got removed. May be reused once decoding v1alpha3 is no longer
 	// supported.
 	// DeallocationRequested bool
+
+	// Devices contains the status of each device allocated for this
+	// claim, as reported by the driver. This can include driver-specific
+	// information. Entries are owned by their respective drivers.
+	//
+	// +optional
+	// +listType=map
+	// +listMapKey=driver
+	// +listMapKey=device
+	// +listMapKey=pool
+	// +featureGate=DRAResourceClaimDeviceStatus
+	Devices []AllocatedDeviceStatus
 }
 
 // ReservedForMaxSize is the maximum number of entries in
@@ -888,7 +920,7 @@ type DeviceClassSpec struct {
 	// SuitableNodes is tombstoned since Kubernetes 1.32 where
 	// it got removed. May be reused once decoding v1alpha3 is no longer
 	// supported.
-	// SuitableNodes *v1.NodeSelector `json:"suitableNodes,omitempty" protobuf:"bytes,3,opt,name=suitableNodes"`
+	// SuitableNodes *core.NodeSelector
 }
 
 // DeviceClassConfiguration is used in DeviceClass.
@@ -954,4 +986,89 @@ type ResourceClaimTemplateList struct {
 
 	// Items is the list of resource claim templates.
 	Items []ResourceClaimTemplate
+}
+
+// AllocatedDeviceStatus contains the status of an allocated device, if the
+// driver chooses to report it. This may include driver-specific information.
+type AllocatedDeviceStatus struct {
+	// Driver specifies the name of the DRA driver whose kubelet
+	// plugin should be invoked to process the allocation once the claim is
+	// needed on a node.
+	//
+	// Must be a DNS subdomain and should end with a DNS domain owned by the
+	// vendor of the driver.
+	//
+	// +required
+	Driver string
+
+	// This name together with the driver name and the device name field
+	// identify which device was allocated (`<driver name>/<pool name>/<device name>`).
+	//
+	// Must not be longer than 253 characters and may contain one or more
+	// DNS sub-domains separated by slashes.
+	//
+	// +required
+	Pool string
+
+	// Device references one device instance via its name in the driver's
+	// resource pool. It must be a DNS label.
+	//
+	// +required
+	Device string
+
+	// Conditions contains the latest observation of the device's state.
+	// If the device has been configured according to the class and claim
+	// config references, the `Ready` condition should be True.
+	//
+	// Must not contain more than 8 entries.
+	//
+	// +optional
+	// +listType=map
+	// +listMapKey=type
+	Conditions []metav1.Condition
+
+	// Data contains arbitrary driver-specific data.
+	//
+	// The length of the raw data must be smaller or equal to 10 Ki.
+	//
+	// +optional
+	Data runtime.RawExtension
+
+	// NetworkData contains network-related information specific to the device.
+	//
+	// +optional
+	NetworkData *NetworkDeviceData
+}
+
+// NetworkDeviceData provides network-related details for the allocated device.
+// This information may be filled by drivers or other components to configure
+// or identify the device within a network context.
+type NetworkDeviceData struct {
+	// InterfaceName specifies the name of the network interface associated with
+	// the allocated device. This might be the name of a physical or virtual
+	// network interface being configured in the pod.
+	//
+	// Must not be longer than 256 characters.
+	//
+	// +optional
+	InterfaceName string
+
+	// IPs lists the network addresses assigned to the device's network interface.
+	// This can include both IPv4 and IPv6 addresses.
+	// The IPs are in the CIDR notation, which includes both the address and the
+	// associated subnet mask.
+	// e.g.: "192.0.2.5/24" for IPv4 and "2001:db8::5/64" for IPv6.
+	//
+	// Must not contain more than 16 entries.
+	//
+	// +optional
+	// +listType=atomic
+	IPs []string
+
+	// HardwareAddress represents the hardware address (e.g. MAC Address) of the device's network interface.
+	//
+	// Must not be longer than 128 characters.
+	//
+	// +optional
+	HardwareAddress string
 }
